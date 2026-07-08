@@ -350,12 +350,6 @@ class MemoryStore:
                 "UPDATE tasks SET status = 'completed', updated_at = ? WHERE task_id = ?",
                 (_now_iso(), progress.task_id),
             )
-            self.publish_event(TaskEvent(
-                task_id=progress.task_id,
-                event_type=EventType.TASK_HANDOFF.value,
-                agent_id=progress.agent_id,
-                payload=json.dumps({"action": "completed", "summary": progress.summary}, ensure_ascii=False),
-            ))
 
         elif progress.action == TaskAction.UPDATED:
             # P1-1: 不把已 completed 的任务打回 in_progress
@@ -366,6 +360,14 @@ class MemoryStore:
 
         conn.commit()
         conn.close()
+
+        if progress.action == TaskAction.COMPLETED:
+            self.publish_event(TaskEvent(
+                task_id=progress.task_id,
+                event_type=EventType.TASK_HANDOFF.value,
+                agent_id=progress.agent_id,
+                payload=json.dumps({"action": "completed", "summary": progress.summary}, ensure_ascii=False),
+            ))
 
         self._append_progress_md(progress)
 
