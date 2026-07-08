@@ -71,6 +71,7 @@ class MemoryStore:
 
     def _init_db(self):
         conn = self._get_conn()
+        conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS tasks (
@@ -148,6 +149,13 @@ class MemoryStore:
             );
             CREATE INDEX IF NOT EXISTS idx_events_ts ON events(timestamp);
             CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id);
+
+            -- P2-2: schema 版本追踪
+            CREATE TABLE IF NOT EXISTS meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '0');
             """
         )
         # P0-1: 显式 migration — 给老 tasks 表加新字段
@@ -160,19 +168,26 @@ class MemoryStore:
             self.register_agent(agent)
 
     def _migrate_schema(self, conn):
-        """P0-1: 显式 migration — 检查字段是否存在，不存在才 ALTER TABLE ADD COLUMN。
-        CREATE TABLE IF NOT EXISTS 对已存在的表是 no-op，加字段必须显式 ALTER。"""
-        task_cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()}
-        task_migrations = [
-            ("revision_count", "INTEGER DEFAULT 0"),
-        ]
-        for col, typedef in task_migrations:
-            if col not in task_cols:
-                conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {typedef}")
+        """P2-2: 版本化 migration — 每步按 schema_version 执行，不再盲目 PRAGMA table_info。"""
+        version = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+        v = int(version["value"]) if version else 0
 
-        agent_cols = {r["name"] for r in conn.execute("PRAGMA table_info(agents)").fetchall()}
-        if "keywords" not in agent_cols:
-            conn.execute("ALTER TABLE agents ADD COLUMN keywords TEXT DEFAULT '[]'")
+        migrations = [
+            # v0→v1: tasks.revision_count, agents.keywords
+            (1, [
+                ("tasks", "revision_count", "INTEGER DEFAULT 0"),
+                ("agents", "keywords", "TEXT DEFAULT '[]'"),
+            ]),
+        ]
+
+        for ver, steps in migrations:
+            if v < ver:
+                for table, col, typedef in steps:
+                    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+                    if col not in cols:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typedef}")
+                conn.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", (str(ver),))
+                v = ver
 
     # ── Task 操作 ──────────────────────────────────────────
 
@@ -277,15 +292,19 @@ class MemoryStore:
         return [self._row_to_task(r) for r in rows]
 
     def list_active_tasks(self, agent_id: str = "") -> list[Task]:
+        """P2-4: 活跃任务列表。completed > 7 天的自动归档，不出现在活跃视图。"""
         conn = self._get_conn()
+        # 只显示：非 completed 的 或 completed 但还在 7 天内的
+        where_archive = "(status != 'completed' OR (status = 'completed' AND updated_at > datetime('now', '-7 days', '+8 hours')))"
+        # 时区修正：DB 存的是 UTC+0，本地 CST=UTC+8，所以 +8 hours 对齐
         if agent_id:
             rows = conn.execute(
-                "SELECT * FROM tasks WHERE current_agent = ? AND status IN ('pending','in_progress','handed_off') ORDER BY updated_at DESC",
+                f"SELECT * FROM tasks WHERE current_agent = ? AND {where_archive} ORDER BY updated_at DESC",
                 (agent_id,),
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT * FROM tasks WHERE status IN ('pending','in_progress','handed_off') ORDER BY updated_at DESC"
+                f"SELECT * FROM tasks WHERE {where_archive} ORDER BY updated_at DESC"
             ).fetchall()
         conn.close()
         return [self._row_to_task(r) for r in rows]
@@ -331,9 +350,17 @@ class MemoryStore:
                 "UPDATE tasks SET status = 'completed', updated_at = ? WHERE task_id = ?",
                 (_now_iso(), progress.task_id),
             )
+            self.publish_event(TaskEvent(
+                task_id=progress.task_id,
+                event_type=EventType.TASK_HANDOFF.value,
+                agent_id=progress.agent_id,
+                payload=json.dumps({"action": "completed", "summary": progress.summary}, ensure_ascii=False),
+            ))
+
         elif progress.action == TaskAction.UPDATED:
+            # P1-1: 不把已 completed 的任务打回 in_progress
             conn.execute(
-                "UPDATE tasks SET status = 'in_progress', updated_at = ? WHERE task_id = ?",
+                "UPDATE tasks SET status = 'in_progress', updated_at = ? WHERE task_id = ? AND status != 'completed'",
                 (_now_iso(), progress.task_id),
             )
 
@@ -341,6 +368,23 @@ class MemoryStore:
         conn.close()
 
         self._append_progress_md(progress)
+
+        # P1-1: 关连接后再发事件，避免 SQLite 锁冲突
+        if progress.action == TaskAction.COMPLETED:
+            self.publish_event(TaskEvent(
+                task_id=progress.task_id,
+                event_type="task_completed",
+                agent_id=progress.agent_id,
+                payload=json.dumps({"summary": progress.summary[:200]}, ensure_ascii=False),
+            ))
+        elif progress.action == TaskAction.HANDED_OFF:
+            self.publish_event(TaskEvent(
+                task_id=progress.task_id,
+                event_type="task_handoff",
+                agent_id=progress.agent_id,
+                payload=json.dumps({"summary": progress.summary[:200]}, ensure_ascii=False),
+            ))
+
         return progress
 
     def get_task_progress(self, task_id: str) -> list[TaskProgress]:
@@ -389,6 +433,21 @@ class MemoryStore:
         for p in progress_list:
             lines.append(f"\n### [{p.timestamp}] {p.agent_id} — {p.action.value}")
             lines.append(p.summary or "无")
+
+        # 群聊讨论（评论 + review）
+        comments = self.list_comments(task_id)
+        if comments:
+            lines.append("")
+            lines.append("## 群聊讨论")
+            for c in comments:
+                verdict_badge = ""
+                if c.verdict:
+                    verdict_badge = f" [裁决: {c.verdict}]"
+                artifact_ref = f" → artifact {c.artifact_id}" if c.artifact_id else ""
+                lines.append(
+                    f"\n### [{c.created_at}] {c.agent_id} — {c.comment_type.value}{verdict_badge}{artifact_ref}"
+                )
+                lines.append(c.content or "无")
 
         return "\n".join(lines)
 
@@ -463,6 +522,13 @@ class MemoryStore:
         content += f"\n### [{progress.timestamp}] {progress.agent_id} — {progress.action.value}\n{progress.summary or '无'}\n"
         ctx_path.write_text(content, encoding="utf-8")
 
+    def _refresh_context_md(self, task_id: str):
+        """重建 context.md 快照，包含进度+评论"""
+        ctx = self.get_task_context(task_id)
+        if ctx:
+            ctx_path = self.tasks_dir / task_id / "context.md"
+            ctx_path.write_text(ctx, encoding="utf-8")
+
     # ── 群聊协作层：Comment 操作 ────────────────────────────
 
     def add_comment(self, comment: TaskComment) -> TaskComment:
@@ -484,6 +550,7 @@ class MemoryStore:
             agent_id=comment.agent_id,
             payload=json.dumps({"comment_id": comment.comment_id, "content": comment.content[:200]}, ensure_ascii=False),
         ))
+        self._refresh_context_md(comment.task_id)
         return comment
 
     def list_comments(self, task_id: str, comment_type: str = "") -> list[TaskComment]:
@@ -524,6 +591,7 @@ class MemoryStore:
             agent_id=artifact.agent_id,
             payload=json.dumps({"artifact_id": artifact.artifact_id, "type": artifact.artifact_type}, ensure_ascii=False),
         ))
+        self._refresh_context_md(artifact.task_id)
         return artifact
 
     def list_artifacts(self, task_id: str, status: str = "") -> list[TaskArtifact]:
@@ -605,6 +673,7 @@ class MemoryStore:
             agent_id=reviewer,
             payload=json.dumps({"artifact_id": artifact_id, "verdict": verdict}, ensure_ascii=False),
         ))
+        self._refresh_context_md(task_id)
         return comment
 
     # ── Reopen 操作（P1-1: 强制约束）─────────────────────────
@@ -739,25 +808,29 @@ class MemoryStore:
         return event
 
     def poll_events(self, agent_id: str, since_ts: int = 0, timeout: int = 30) -> list[TaskEvent]:
-        """长轮询拉取未消费事件。timeout 秒内每 1s 查一次，有新事件立即返回，超时返回空列表。"""
+        """P3-5: 长轮询拉取未消费事件。用 json.loads 判断是否已消费（不依赖 NOT LIKE）。"""
         import time
         deadline = time.time() + timeout
         while time.time() < deadline:
             conn = self._get_conn()
             rows = conn.execute(
-                """SELECT * FROM events WHERE timestamp > ?
-                   AND consumed_by NOT LIKE ?
-                   ORDER BY timestamp ASC""",
-                (since_ts, f'%"{agent_id}"%'),
+                "SELECT * FROM events WHERE timestamp > ? ORDER BY timestamp ASC",
+                (since_ts,),
             ).fetchall()
             conn.close()
-            if rows:
-                return [self._row_to_event(r) for r in rows]
+            # P3-5: 内存中过滤已消费事件，避免 JSON LIKE 子串误匹配
+            unread = []
+            for r in rows:
+                consumed = json.loads(r["consumed_by"]) if r["consumed_by"] else []
+                if agent_id not in consumed:
+                    unread.append(self._row_to_event(r))
+            if unread:
+                return unread
             time.sleep(1)
         return []
 
     def ack_event(self, event_id: str, agent_id: str) -> bool:
-        """确认消费事件，避免重复推送"""
+        """P2-3: 确认消费事件。全 agent 消费后自动清理该事件行。"""
         conn = self._get_conn()
         row = conn.execute("SELECT consumed_by FROM events WHERE event_id = ?", (event_id,)).fetchone()
         if not row:
@@ -770,7 +843,11 @@ class MemoryStore:
                 "UPDATE events SET consumed_by = ? WHERE event_id = ?",
                 (json.dumps(consumed, ensure_ascii=False), event_id),
             )
-            conn.commit()
+            # P2-3: 全 agent 已消费 → 删除
+            all_agents = {a.agent_id for a in self.list_agents()}
+            if all(ag in consumed for ag in all_agents):
+                conn.execute("DELETE FROM events WHERE event_id = ?", (event_id,))
+        conn.commit()
         conn.close()
         return True
 
@@ -815,5 +892,5 @@ class MemoryStore:
 
 
 def _now_iso() -> str:
-    from datetime import datetime
-    return datetime.now().isoformat()
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()

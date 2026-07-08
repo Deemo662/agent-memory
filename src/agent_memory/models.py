@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
@@ -55,6 +55,7 @@ class EventType(str, Enum):
     TASK_REOPENED = "task_reopened"
     TASK_HANDOFF = "task_handoff"
     SUGGEST_AGENT = "suggest_agent"
+    CONVENTION_UPDATED = "convention_updated"
 
 
 class Task(BaseModel):
@@ -64,8 +65,8 @@ class Task(BaseModel):
     status: TaskStatus = TaskStatus.PENDING
     created_by: str
     current_agent: str = ""
-    created_at: str = Field(default_factory=lambda: datetime.now().isoformat())
-    updated_at: str = Field(default_factory=lambda: datetime.now().isoformat())
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     tags: list[str] = Field(default_factory=list)
     priority: str = "normal"
     # P1-1: reopen 计数，上限 3 次
@@ -76,7 +77,7 @@ class TaskProgress(BaseModel):
     progress_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     task_id: str
     agent_id: str
-    timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
+    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     action: TaskAction
     summary: str = ""
     context_file: str = ""
@@ -86,7 +87,7 @@ class AgentInfo(BaseModel):
     agent_id: str
     agent_name: str
     capabilities: str = ""
-    registered_at: str = Field(default_factory=lambda: datetime.now().isoformat())
+    registered_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     # P0-2: 二级关键词清单，弥补粗糙 capabilities
     keywords: list[str] = Field(default_factory=list)
 
@@ -103,7 +104,7 @@ class TaskComment(BaseModel):
     # P1-3: review 类型时填写 verdict
     verdict: str = ""
     artifact_id: str = ""  # review 关联的产出物
-    created_at: str = Field(default_factory=lambda: datetime.now().isoformat())
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 class TaskArtifact(BaseModel):
@@ -116,8 +117,8 @@ class TaskArtifact(BaseModel):
     version: int = 1
     status: ArtifactStatus = ArtifactStatus.ACTIVE
     superseded_by: str = ""
-    created_at: str = Field(default_factory=lambda: datetime.now().isoformat())
-    updated_at: str = Field(default_factory=lambda: datetime.now().isoformat())
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 class TaskEvent(BaseModel):
@@ -127,7 +128,7 @@ class TaskEvent(BaseModel):
     event_type: str
     agent_id: str  # 触发者
     # B-1: 整数 Unix ts 作排序键，isoformat 仅展示
-    timestamp: int = Field(default_factory=lambda: int(datetime.now().timestamp()))
+    timestamp: int = Field(default_factory=lambda: int(datetime.now(timezone.utc).timestamp()))
     payload: str = "{}"  # JSON string
     consumed_by: str = "[]"  # JSON string of agent_id list
 
